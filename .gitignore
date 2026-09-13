@@ -8,3 +8,4 @@ __pycache__/
 leadgen.db
 *.csv
 .DS_Store
+CLAUDE.md
