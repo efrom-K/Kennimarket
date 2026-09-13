@@ -1,0 +1,10 @@
+.venv/
+.claude/
+__pycache__/
+*.pyc
+.env
+*.session
+*.session-journal
+leadgen.db
+*.csv
+.DS_Store
