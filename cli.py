@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from leadgen import db
 from leadgen.config import settings
-from leadgen.pipeline import run_dgis_pipeline, run_telegram_pipeline
+from leadgen.pipeline import run_dgis_pipeline, run_telegram_pipeline, run_triage
 
 
 def cmd_init(_args):
@@ -104,6 +104,9 @@ def main():
     p_dg.add_argument("--pages", type=int, default=5, help="Сколько страниц выдачи на каждый запрос")
     p_dg.add_argument("--min-confidence", type=float, default=0.4)
     p_dg.set_defaults(func=cmd_dgis)
+
+    sub.add_parser("triage", help="Подготовить первое сообщение лидам без черновика").set_defaults(
+        func=lambda _a: run_triage())
 
     sub.add_parser("stats").set_defaults(func=cmd_stats)
 

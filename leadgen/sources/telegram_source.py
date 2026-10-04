@@ -185,12 +185,17 @@ def iter_telegram_messages(
                             sender = msg.get_sender()
                         except Exception:
                             sender = None
-                        tg_username = sender.username if isinstance(sender, User) else None
+                        # боты-агрегаторы (…_bot) переписку не ведут — это не контакт
+                        person = isinstance(sender, User) and not sender.bot
+                        tg_username = sender.username if person else None
+                        # номер виден, только если человек открыл его в настройках приватности
+                        tg_phone = f"+{sender.phone}" if person and sender.phone else None
                         yield {
                             "source_id": f"{channel}:{msg.id}",
                             "url": f"https://t.me/{channel}/{msg.id}",
                             "raw_text": msg.text,
                             "telegram_username": tg_username,
+                            "telegram_phone": tg_phone,
                             "posted_at": msg.date.isoformat(),
                         }
             except Exception as exc:

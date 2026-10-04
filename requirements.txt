@@ -3,3 +3,4 @@ python-dotenv>=1.0
 telethon>=1.36
 streamlit>=1.40
 pywebview>=5
+openpyxl>=3.1

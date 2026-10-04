@@ -33,10 +33,43 @@ CREATE TABLE IF NOT EXISTS leads (
     status TEXT DEFAULT 'new',
     created_at TEXT NOT NULL
 );
+
+-- Ваши объекты (склады в продаже) — для подбора под запрос.
+CREATE TABLE IF NOT EXISTS objects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT,
+    address TEXT,
+    direction TEXT,
+    mkad_km REAL,
+    area_sqm REAL,
+    class TEXT,
+    price_rub REAL,
+    ceiling_m REAL,
+    gates TEXT,
+    heating TEXT,
+    presentation_url TEXT,
+    notes TEXT,
+    active INTEGER NOT NULL DEFAULT 1
+);
+
+-- Первое сообщение лиду: анкета запроса от модели, подбор объектов, черновик.
+CREATE TABLE IF NOT EXISTS lead_profiles (
+    lead_id INTEGER PRIMARY KEY REFERENCES leads(id),
+    profile_json TEXT NOT NULL,
+    matches_json TEXT,
+    draft TEXT,
+    draft_edited TEXT,
+    processed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 # Columns added after the first release; ALTERed into existing DBs by init_db.
-NEW_LEAD_COLUMNS = ["posted_at TEXT", "buyer_type TEXT", "comment TEXT"]
+NEW_LEAD_COLUMNS = ["posted_at TEXT", "buyer_type TEXT", "comment TEXT", "sent_at TEXT"]
 
 
 def now_iso() -> str:
@@ -117,3 +150,13 @@ def save_lead(conn: sqlite3.Connection, dedup_key: str, source: str, source_ref:
 
 def count_leads(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+
+
+def get_setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row and row[0] is not None else default
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))

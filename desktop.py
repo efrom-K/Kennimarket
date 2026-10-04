@@ -11,6 +11,7 @@ import sys
 import time
 import webbrowser
 from pathlib import Path
+from urllib.parse import parse_qs, quote
 
 import webview
 
@@ -44,15 +45,25 @@ if (!window.__kmLinks) {
 
 
 def telegram_app_url(url: str) -> str:
-    """t.me/name[/post] -> tg://resolve…: сразу в приложении Telegram, без браузера."""
-    m = re.match(r"https?://t\.me/([A-Za-z0-9_]{4,})(?:/(\d+))?/?$", url)
+    """t.me/name[/post][?text=…], t.me/+79… -> tg://resolve…: сразу в приложении Telegram, без браузера."""
+    base, _, query = url.partition("?")
+    text = parse_qs(query).get("text", [None])[0]
+    suffix = f"&text={quote(text)}" if text else ""
+    m = re.match(r"https?://t\.me/\+(\d{10,15})/?$", base)
+    if m:
+        return f"tg://resolve?phone={m.group(1)}{suffix}"
+    m = re.match(r"https?://t\.me/([A-Za-z0-9_]{4,})(?:/(\d+))?/?$", base)
     if not m:
         return url
-    return f"tg://resolve?domain={m.group(1)}" + (f"&post={m.group(2)}" if m.group(2) else "")
+    return f"tg://resolve?domain={m.group(1)}" + (f"&post={m.group(2)}" if m.group(2) else "") + suffix
 
 
 class Api:
     def open_external(self, url: str) -> None:
+        # Текст сообщения — ещё и в буфер обмена: если Telegram не подставит его сам, останется Cmd+V.
+        text = parse_qs(url.partition("?")[2]).get("text", [None])[0]
+        if text:
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"))
         webbrowser.open(telegram_app_url(url))
 
 
@@ -113,6 +124,9 @@ def _self_check() -> None:
     assert telegram_app_url("https://t.me/mossdelka/124221") == "tg://resolve?domain=mossdelka&post=124221"
     assert telegram_app_url("https://t.me/Terner_chat") == "tg://resolve?domain=Terner_chat"
     assert telegram_app_url("https://example.com/x") == "https://example.com/x"
+    assert telegram_app_url("https://t.me/Terner_chat?text=%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82") == \
+        "tg://resolve?domain=Terner_chat&text=%D0%9F%D1%80%D0%B8%D0%B2%D0%B5%D1%82"
+    assert telegram_app_url("https://t.me/+79256667770?text=hi") == "tg://resolve?phone=79256667770&text=hi"
 
 
 if __name__ == "__main__":

@@ -5,8 +5,12 @@
 Сбор и поиск чатов запускаются как фоновые процессы `cli.py` (лог в logs/),
 поэтому интерфейс можно закрывать и открывать — работа не прерывается.
 """
+import io
 import json
 import os
+import re
+from typing import Optional
+from urllib.parse import quote
 import signal
 import subprocess
 import sys
@@ -19,7 +23,8 @@ import streamlit as st
 
 from leadgen import db
 from leadgen.config import settings
-from leadgen.llm import LMStudioClient
+from leadgen import triage
+from leadgen.llm import LLMUnavailable, LMStudioClient
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
@@ -30,7 +35,7 @@ ACCENT = "#2a78d6"
 
 STATUSES = {
     "new": "Новый",
-    "contacted": "Связались",
+    "contacted": "Написали",
     "in_work": "В работе",
     "won": "Сделка",
     "rejected": "Не подошёл",
@@ -54,10 +59,17 @@ def load_leads() -> pd.DataFrame:
         """
         SELECT l.id, l.posted_at, l.status, l.buyer_type, l.confidence, l.telegram_username, l.phone,
                l.contact_name, l.company_name, l.location, l.area_sqm, l.budget, l.source, l.source_ref,
-               l.notes, l.comment, l.created_at, r.raw_text
+               l.notes, l.comment, l.created_at, l.sent_at, r.raw_text,
+               p.lead_id IS NOT NULL AS has_profile, p.profile_json, p.draft, p.draft_edited
         FROM leads l LEFT JOIN raw_items r ON r.url = l.source_ref
+                     LEFT JOIN lead_profiles p ON p.lead_id = l.id
         """
     )
+    df["message"] = df["draft_edited"].where(df["draft_edited"].notna(), df["draft"])
+    df["msg_state"] = "Не обработан"
+    df.loc[df["has_profile"] == 1, "msg_state"] = "Не подходит"
+    df.loc[df["message"].notna(), "msg_state"] = "Готово"
+    df.loc[df["sent_at"].notna(), "msg_state"] = "Отправлено"
     df["posted_at"] = pd.to_datetime(df["posted_at"], utc=True, errors="coerce")
     df["created_at"] = pd.to_datetime(df["created_at"], utc=True, errors="coerce")
     df["status"] = df["status"].fillna("new")
@@ -220,6 +232,89 @@ def set_comment(lead_id: int, key: str) -> None:
     st.toast("Комментарий сохранён", icon=":material/check:")
 
 
+def chat_url(r: pd.Series, text: str = "") -> Optional[str]:
+    """Ссылка на чат с лидом; в приложении для Mac откроет Telegram и положит текст в буфер."""
+    q = f"?text={quote(text)}" if text else ""
+    if pd.notna(r["telegram_username"]):
+        return f"https://t.me/{r['telegram_username']}{q}"
+    if pd.notna(r["phone"]) and str(r["phone"]).startswith("+"):
+        return f"https://t.me/{r['phone']}{q}"
+    return None
+
+
+def save_message(lead_id: int, key: str) -> None:
+    with db.get_conn(settings.db_path) as conn:
+        conn.execute("UPDATE lead_profiles SET draft_edited = ? WHERE lead_id = ?", (st.session_state[key], lead_id))
+
+
+def mark_sent(lead_id: int, key: str) -> None:
+    with db.get_conn(settings.db_path) as conn:
+        conn.execute("UPDATE lead_profiles SET draft_edited = ? WHERE lead_id = ?", (st.session_state[key], lead_id))
+        conn.execute("UPDATE leads SET status = 'contacted', sent_at = ? WHERE id = ?", (db.now_iso(), lead_id))
+    st.toast("Отмечено: написали", icon=":material/check:")
+
+
+def pick_object(lead_id: int, key: str) -> None:
+    if st.session_state[key] is not None:
+        with db.get_conn(settings.db_path) as conn:
+            triage.draft_with_object(conn, lead_id, int(st.session_state[key]))
+
+
+def prepare_message(lead_id: int) -> None:
+    with db.get_conn(settings.db_path) as conn:
+        try:
+            ok = triage.process_lead(conn, LMStudioClient(), lead_id)
+        except LLMUnavailable:
+            ok = False
+    if not ok:
+        st.toast("Не получилось: проверьте, что LM Studio запущена", icon=":material/error:")
+
+
+@st.cache_data(ttl=5)
+def active_objects() -> pd.DataFrame:
+    return query("SELECT * FROM objects WHERE active = 1 ORDER BY id")
+
+
+def message_block(lead_id: int, r: pd.Series) -> None:
+    state = r["msg_state"]
+    if state == "Отправлено":
+        sent = pd.to_datetime(r["sent_at"], utc=True)
+        with st.expander(f"Написали {sent.day} {MONTHS[sent.month - 1]} · что отправили", icon=":material/mark_chat_read:"):
+            st.text(r["message"] or "—")
+        return
+    if state == "Готово":
+        key = f"msg_{lead_id}"
+        st.text_area("Первое сообщение", value=r["message"], key=key, height=170, on_change=save_message,
+                     args=(lead_id, key), help="Можно править — изменения сохраняются")
+        text = st.session_state.get(key, r["message"])
+        url = chat_url(r, text)
+        b1, b2 = st.columns([1.4, 1])
+        if url:
+            b1.link_button("Открыть чат с текстом", url, icon=":material/send:", type="primary", width="stretch",
+                           help="В приложении для Mac текст будет в буфере обмена — вставьте Cmd+V и отправьте")
+        else:
+            b1.button("Нет контакта в Telegram", disabled=True, key=f"nc_{lead_id}", width="stretch")
+        b2.button("Отправил", icon=":material/done:", key=f"sent_{lead_id}", width="stretch",
+                  on_click=mark_sent, args=(lead_id, key))
+        return
+    objs = active_objects()
+    if state == "Не подходит":
+        if objs.empty:
+            st.caption(":material/inventory_2: База складов пуста — добавьте объекты на странице «Объекты».")
+            return
+        profile = json.loads(r["profile_json"])
+        reasons = min((triage.mismatch_reasons(profile, o) for o in objs.to_dict("records")), key=len)
+        st.caption(f":material/block: Ваши склады не подходят: {'; '.join(reasons)}")
+        key = f"pick_{lead_id}"
+        st.selectbox("Всё равно предложить", objs["id"].tolist(), index=None, key=key, on_change=pick_object,
+                     args=(lead_id, key), placeholder="Всё равно предложить объект…", label_visibility="collapsed",
+                     format_func=lambda i: objs.set_index("id").loc[i, "title"] or f"Объект #{i}")
+        return
+    st.button("Подготовить сообщение", icon=":material/edit_note:", key=f"prep_{lead_id}", width="stretch",
+              on_click=prepare_message, args=(lead_id,), disabled=not llm_online(),
+              help="Модель разберёт запрос и подберёт ваш склад (≈10 с)")
+
+
 def lead_card(lead_id: int, r: pd.Series) -> None:
     with st.container(border=True):
         st.markdown("<div class='lead-card'></div>", unsafe_allow_html=True)
@@ -236,41 +331,39 @@ def lead_card(lead_id: int, r: pd.Series) -> None:
 
         text = str(r["raw_text"] or "").replace("<", "&lt;").replace("\n", " ")
         st.markdown(f"<div class='lead-text'>{text}</div>", unsafe_allow_html=True)
+        contact = [f"@{r['telegram_username']}" if pd.notna(r["telegram_username"]) else None,
+                   r["phone"] if pd.notna(r["phone"]) else None]
+        contact = [c for c in contact if c]
+        st.caption(":material/person: " + (" · ".join(contact) if contact else "контакта нет — только через пост"))
 
-        chips = [(":material/location_on:", r["location"]), (":material/square_foot:", r["area_sqm"]),
-                 (":material/payments:", r["budget"]), (":material/call:", r["phone"])]
-        chips = [f"{icon} {val}" for icon, val in chips if pd.notna(val) and str(val).strip()]
-        if chips:
-            st.markdown(" &nbsp;·&nbsp; ".join(chips))
+        message_block(lead_id, r)
 
-        b1, b2, b3 = st.columns(3)
-        if pd.notna(r["telegram_username"]):
-            b1.link_button("Написать", f"https://t.me/{r['telegram_username']}", icon=":material/send:",
-                           type="primary", width="stretch")
-        else:
-            b1.button("Нет контакта", disabled=True, key=f"nc_{lead_id}", width="stretch")
-        b2.link_button("Сообщение", r["source_ref"] or "#", icon=":material/open_in_new:", width="stretch")
-        with b3.popover("Детали", icon=":material/more_horiz:", width="stretch"):
+        b1, b2 = st.columns(2)
+        b1.link_button("Пост в чате", r["source_ref"] or "#", icon=":material/open_in_new:", width="stretch")
+        with b2.popover("Детали", icon=":material/more_horiz:", width="stretch"):
             st.markdown("**Полный текст**")
             st.text(r["raw_text"] or "—")
+            if pd.notna(r["profile_json"]):
+                pr = json.loads(r["profile_json"])
+                if pr.get("requirements"):
+                    st.caption(f"Требования: {pr['requirements']}")
             if pd.notna(r["notes"]) and r["notes"]:
                 st.caption(f"Модель: {r['notes']}")
-            if pd.notna(r["confidence"]):
-                st.caption(f"Уверенность модели: {r['confidence']:.0%}")
             ckey = f"comment_{lead_id}"
             st.text_area("Комментарий", value=r["comment"] if pd.notna(r["comment"]) else "", key=ckey,
-                         on_change=set_comment, args=(lead_id, ckey), placeholder="Позвонил, ждёт варианты до пятницы…")
+                         on_change=set_comment, args=(lead_id, ckey), placeholder="Позвонил, ждёт презентацию…")
 
 
 def page_leads():
-    page_header("Лиды", "Запросы на покупку складов из Telegram — свежие сверху")
+    page_header("Лиды", "Запросы на покупку складов из Telegram и готовые первые сообщения")
     leads = load_leads()
     if leads.empty:
         st.info("Лидов пока нет. Запустите сбор на странице «Сбор».", icon=":material/info:")
         return
 
     f1, f2, f3 = st.columns([1, 1.7, 2.9], vertical_alignment="bottom")
-    f4 = st
+    f5, f4 = st.columns([2.4, 3.2], vertical_alignment="bottom")
+    msg_filter = f5.segmented_control("Первое сообщение", ["Все", "Готово", "Не подходит", "Отправлено"], default="Все")
     period = f1.selectbox("Период", ["7 дней", "30 дней", "90 дней", "Год", "Всё время"], index=2)
     types = f2.segmented_control("Кто ищет", ["Покупатель", "Брокер", "Неясно"], selection_mode="multi",
                                  default=["Покупатель", "Брокер", "Неясно"])
@@ -285,6 +378,11 @@ def page_leads():
     view = view[view["buyer_label"].isin(types or []) & view["status_label"].isin(statuses or [])]
     if search:
         view = view[view["raw_text"].fillna("").str.contains(search, case=False, regex=False)]
+    if msg_filter and msg_filter != "Все":
+        view = view[view["msg_state"] == msg_filter]
+    # сначала те, кому пора писать; внутри — свежие сверху (сортировка устойчивая)
+    order = {"Готово": 0, "Не обработан": 1, "Не подходит": 2, "Отправлено": 3}
+    view = view.sort_values("msg_state", key=lambda s: s.map(order), kind="stable")
 
     c1, c2, c3 = st.columns([3, 1.3, 1], vertical_alignment="center")
     c1.caption(f"Найдено **{len(view)}** из {len(leads)}")
@@ -297,7 +395,7 @@ def page_leads():
         return
 
     if mode == "Таблица":
-        leads_table(view, key=f"leads_{period}_{types}_{statuses}_{search}")
+        leads_table(view, key=f"leads_{period}_{types}_{statuses}_{search}_{msg_filter}")
         return
 
     shown = st.session_state.setdefault("cards_shown", 12)
@@ -369,10 +467,10 @@ def page_overview():
     m = st.columns(5)
     m[0].metric("Всего лидов", len(leads), border=True)
     m[1].metric("За 7 дней", fresh(7), border=True)
-    m[2].metric("За 30 дней", fresh(30), border=True)
-    m[3].metric("С контактом", f"{leads['has_contact'].mean():.0%}", border=True)
-    m[4].metric("Покупателей", int((leads["buyer_type"] == "direct").sum()), border=True,
-                help="Прямые покупатели. Остальные — брокеры, которые ищут объект для клиента, или неясно")
+    m[2].metric("Готово к отправке", int((leads["msg_state"] == "Готово").sum()), border=True,
+                help="Есть черновик первого сообщения с вашим складом")
+    m[3].metric("Написали", int((leads["msg_state"] == "Отправлено").sum()), border=True)
+    m[4].metric("С контактом", f"{leads['has_contact'].mean():.0%}", border=True)
 
     g1, g2 = st.columns(2)
     with g1.container(border=True):
@@ -502,6 +600,17 @@ def page_run():
                                       str(int(min_members)), "--out", str(CHANNELS_FILE)])
             st.rerun()
 
+    with st.container(border=True):
+        n_raw = int(query("""SELECT COUNT(*) n FROM leads l JOIN raw_items r ON r.url = l.source_ref
+                             WHERE l.source = 'telegram' AND l.id NOT IN (SELECT lead_id FROM lead_profiles)""").n[0])
+        c1, c2 = st.columns([3, 1], vertical_alignment="center")
+        c1.markdown("**:material/edit_note: Подготовить первые сообщения**")
+        c1.caption(f"Лидов без черновика: {n_raw}. Новые лиды обрабатываются сами во время сбора; "
+                   "эта кнопка — для старых и для тех, на ком модель не ответила.")
+        if c2.button("Подготовить", width="stretch", disabled=busy or not online or n_raw == 0):
+            start_job(f"Подготовка сообщений · {n_raw} лидов", ["triage"])
+            st.rerun()
+
     if busy:
         st.caption("Пока идёт задача, новую запустить нельзя — Telegram-сессия одна.")
 
@@ -563,6 +672,160 @@ def page_chats():
         st.toast("Список чатов сохранён", icon=":material/check:")
 
 
+# ---------- Объекты ----------
+
+OBJECT_COLUMNS = {  # колонка в базе -> заголовок в Excel
+    "title": "Название", "address": "Адрес", "direction": "Направление (шоссе)", "mkad_km": "От МКАД, км",
+    "area_sqm": "Площадь, м²", "class": "Класс", "price_rub": "Цена, ₽", "ceiling_m": "Потолки, м",
+    "gates": "Ворота/пандусы", "heating": "Отопление", "presentation_url": "Презентация (ссылка)",
+    "notes": "Комментарий", "active": "В продаже",
+}
+NUMERIC = {"mkad_km", "area_sqm", "price_rub", "ceiling_m"}
+EXAMPLE = {"title": "Склад Видное", "address": "МО, Видное, ул. Промышленная, 5", "direction": "Каширское шоссе",
+           "mkad_km": 12, "area_sqm": 1200, "class": "B", "price_rub": 95000000, "ceiling_m": 9,
+           "gates": "2 ворот, пандус", "heating": "тёплый", "presentation_url": "https://…",
+           "notes": "свободен", "active": "да"}
+
+
+def to_number(v) -> Optional[float]:
+    """«95 млн», «1,4 млрд», «95 000 000», 95000000.0 -> число."""
+    if v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == "":
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    t = str(v).lower().replace("\xa0", "").replace(" ", "").replace(",", ".")
+    mult = 1e9 if "млрд" in t else 1e6 if "млн" in t else 1e3 if "тыс" in t else 1
+    m = re.search(r"\d+(\.\d+)?", t)
+    return float(m.group(0)) * mult if m else None
+
+
+def _norm(header: str) -> str:
+    return re.sub(r"[^а-яёa-z0-9]", "", header.lower().replace("²", "2"))
+
+
+def _column_for(header: str) -> Optional[str]:
+    """Заголовок из файла -> колонка базы: «Площадь, м2», «площадь», «Цена» тоже подходят."""
+    h = _norm(header)
+    for k, v in OBJECT_COLUMNS.items():
+        if h == _norm(v):
+            return k
+    for k, v in OBJECT_COLUMNS.items():
+        first = _norm(v.split()[0] if k != "mkad_km" else "мкад")
+        if h.startswith(first) or (k == "mkad_km" and "мкад" in h):
+            return k
+    return None
+
+
+def template_xlsx() -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        pd.DataFrame(columns=list(OBJECT_COLUMNS.values())).to_excel(xw, sheet_name="Склады", index=False)
+        pd.DataFrame([{OBJECT_COLUMNS[k]: v for k, v in EXAMPLE.items()}]).to_excel(
+            xw, sheet_name="Пример заполнения", index=False)
+        for ws in xw.book.worksheets:
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width = 22
+    return buf.getvalue()
+
+
+def parse_objects(upload) -> pd.DataFrame:
+    if upload.name.lower().endswith((".xlsx", ".xls")):
+        raw = pd.read_excel(upload, sheet_name=0)
+    else:
+        data = upload.getvalue()
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = data.decode("cp1251")
+        first = text.splitlines()[0] if text else ""
+        sep = max([";", "\t", ","], key=first.count)  # русский Excel сохраняет CSV через «;»
+        raw = pd.read_csv(io.StringIO(text), sep=sep)
+    raw = raw.rename(columns=lambda c: _column_for(str(c)) or c)
+    df = pd.DataFrame({k: raw[k] if k in raw else None for k in OBJECT_COLUMNS})
+    for k in NUMERIC:
+        df[k] = df[k].map(to_number)
+    df["active"] = df["active"].map(lambda v: 0 if str(v).strip().lower() in ("нет", "0", "false", "снят") else 1)
+    df = df[df["title"].notna() | df["area_sqm"].notna()]
+    return df.astype(object).where(df.notna(), None)
+
+
+def save_objects(df: pd.DataFrame, replace: bool) -> None:
+    rows = df[list(OBJECT_COLUMNS)].astype(object).where(df[list(OBJECT_COLUMNS)].notna(), None).values.tolist()
+    with db.get_conn(settings.db_path) as conn:
+        if replace:
+            conn.execute("DELETE FROM objects")
+        conn.executemany(f"INSERT INTO objects ({', '.join(OBJECT_COLUMNS)}) VALUES ({', '.join('?' * len(OBJECT_COLUMNS))})", rows)
+        n = triage.rematch_all(conn)  # подбор и черновики — под новую базу, без модели
+    active_objects.clear()
+    st.toast(f"База сохранена, черновики пересобраны для {n} лидов", icon=":material/check:")
+
+
+def page_objects():
+    page_header("Объекты", "Готовые склады, которые вы продаёте. Под них подбираются лиды и пишутся сообщения.")
+    objs = query(f"SELECT id, {', '.join(OBJECT_COLUMNS)} FROM objects ORDER BY id")
+
+    with st.container(border=True):
+        st.markdown("**Загрузить из Excel**")
+        c1, c2 = st.columns([1, 2], vertical_alignment="center")
+        c1.download_button("Скачать шаблон", template_xlsx(), file_name="kennimarket_sklady.xlsx",
+                           icon=":material/download:", width="stretch",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        c2.caption("Заполните лист «Склады» (на втором листе — пример). Обязательно: площадь; "
+                   "желательно направление, удалённость от МКАД и цена — по ним идёт подбор.")
+        upload = st.file_uploader("Файл со складами", type=["xlsx", "xls", "csv"], label_visibility="collapsed")
+        if upload:
+            try:
+                parsed = parse_objects(upload)
+            except Exception as exc:
+                st.error(f"Не получилось прочитать файл: {exc}", icon=":material/error:")
+                parsed = None
+            if parsed is not None:
+                st.caption(f"В файле {len(parsed)} объектов:")
+                st.dataframe(parsed.rename(columns=OBJECT_COLUMNS), hide_index=True, width="stretch")
+                u1, u2 = st.columns(2)
+                if u1.button("Заменить всю базу", type="primary", width="stretch", disabled=parsed.empty):
+                    save_objects(parsed, replace=True)
+                    st.rerun()
+                if u2.button("Добавить к базе", width="stretch", disabled=parsed.empty):
+                    save_objects(parsed, replace=False)
+                    st.rerun()
+
+    st.markdown(f"**В базе: {len(objs)}** · в продаже {int((objs['active'] == 1).sum()) if not objs.empty else 0}")
+    edit = objs.drop(columns=["id"]).assign(active=objs["active"].astype(bool))
+    edited = st.data_editor(
+        edit, key="objects_editor", num_rows="dynamic", hide_index=True, width="stretch",
+        column_config={k: (st.column_config.CheckboxColumn(v) if k == "active" else
+                           st.column_config.NumberColumn(v, format="localized") if k in NUMERIC
+                           else st.column_config.LinkColumn(v) if k == "presentation_url"
+                           else st.column_config.TextColumn(v)) for k, v in OBJECT_COLUMNS.items()},
+    )
+    if st.button("Сохранить изменения", icon=":material/save:", type="primary"):
+        save_objects(edited.assign(active=edited["active"].fillna(True).astype(int)), replace=True)
+        st.rerun()
+
+
+# ---------- Настройки ----------
+
+def page_settings():
+    page_header("Настройки", "Как вы представляетесь в первом сообщении")
+    with db.get_conn(settings.db_path) as conn:
+        cur = {k: db.get_setting(conn, k) for k in ("agency", "manager", "phone")}
+    with st.form("sign"):
+        agency = st.text_input("Агентство", value=cur["agency"], placeholder="Склады МО")
+        manager = st.text_input("Имя менеджера", value=cur["manager"], placeholder="Иван")
+        phone = st.text_input("Ваш телефон (необязательно)", value=cur["phone"], placeholder="+7 900 000-00-00",
+                              help="Если указать — добавится в конец сообщения")
+        if st.form_submit_button("Сохранить", type="primary"):
+            with db.get_conn(settings.db_path) as conn:
+                for k, v in (("agency", agency), ("manager", manager), ("phone", phone)):
+                    db.set_setting(conn, k, v.strip())
+                n = triage.rematch_all(conn)
+            st.toast(f"Сохранено, черновики обновлены ({n})", icon=":material/check:")
+    st.caption("Так начнётся сообщение:")
+    st.code(f"Добрый день! Меня зовут {manager or '…'}, агентство «{agency or '…'}».", language=None)
+    st.caption("Черновики, которые вы уже правили вручную, не перезаписываются.")
+
+
 # ---------- навигация и состояние ----------
 
 nav = st.navigation([
@@ -570,6 +833,8 @@ nav = st.navigation([
     st.Page(page_overview, title="Обзор", icon=":material/insights:", url_path="overview"),
     st.Page(page_run, title="Сбор", icon=":material/radar:", url_path="run"),
     st.Page(page_chats, title="Чаты", icon=":material/forum:", url_path="chats"),
+    st.Page(page_objects, title="Объекты", icon=":material/warehouse:", url_path="objects"),
+    st.Page(page_settings, title="Настройки", icon=":material/settings:", url_path="settings"),
 ])
 
 with st.sidebar:

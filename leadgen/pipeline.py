@@ -2,7 +2,7 @@ import re
 import time
 from typing import List, Optional
 
-from . import db
+from . import db, triage
 from .config import settings
 from .llm import DGIS_SYSTEM_PROMPT, TELEGRAM_SYSTEM_PROMPT, LLMUnavailable, LMStudioClient
 
@@ -32,9 +32,19 @@ def is_telegram_lead(result: Optional[dict], min_confidence: float) -> bool:
         return False
 
 
+def normalize_phone(phone: Optional[str]) -> Optional[str]:
+    """8 925 666-77-70, +7(925)6667770 -> +79256667770: один человек = один лид."""
+    digits = re.sub(r"\D", "", phone or "")
+    if len(digits) == 11 and digits[0] in "78":
+        return "+7" + digits[1:]
+    if len(digits) == 10 and digits[0] == "9":
+        return "+7" + digits
+    return phone.strip() if phone and phone.strip() else None
+
+
 def _dedup_key(fields: dict, source: str, source_id: str) -> str:
     for key in ("phone", "email", "telegram_username"):
-        val = fields.get(key)
+        val = normalize_phone(fields.get(key)) if key == "phone" else fields.get(key)
         if val:
             return f"{key}:{str(val).strip().lower()}"
     company = fields.get("company_name")
@@ -104,7 +114,7 @@ def run_telegram_pipeline(
                 "intent": result.get("intent"),
                 "company_name": result.get("company_name"),
                 "contact_name": result.get("contact_name"),
-                "phone": result.get("phone"),
+                "phone": normalize_phone(result.get("phone") or item.get("telegram_phone")),
                 "telegram_username": item.get("telegram_username"),
                 "location": result.get("location"),
                 "area_sqm": result.get("area_sqm"),
@@ -119,6 +129,11 @@ def run_telegram_pipeline(
                 saved += 1
                 label = fields.get("company_name") or fields.get("contact_name") or key
                 print(f"  [+] lead #{saved}: {label}")
+                lead_id = conn.execute("SELECT id FROM leads WHERE dedup_key = ?", (key,)).fetchone()[0]
+                try:  # сразу готовим первое сообщение; не вышло — подготовится командой triage
+                    triage.process_lead(conn, llm, lead_id)
+                except LLMUnavailable:
+                    pass
 
             if db.count_leads(conn) >= settings.target_leads:
                 print("[i] достигнут TARGET_LEADS, останавливаюсь")
@@ -176,3 +191,23 @@ def run_dgis_pipeline(
                 print("[i] достигнут TARGET_LEADS, останавливаюсь")
                 break
     print(f"[2gis] новых лидов сохранено: {saved}")
+
+
+def run_triage() -> None:
+    """Подготовить первое сообщение для лидов, у которых его ещё нет, и пересобрать подбор у остальных."""
+    llm = LMStudioClient()
+    if not _check_llm(llm):
+        return
+    db.init_db(settings.db_path)
+    with db.get_conn(settings.db_path) as conn:
+        ids = triage.unprocessed_lead_ids(conn)
+        print(f"[triage] без черновика: {len(ids)}")
+        done = 0
+        for i, lead_id in enumerate(ids, 1):
+            try:
+                done += triage.process_lead(conn, llm, lead_id)
+            except LLMUnavailable:
+                print(LLM_DOWN_MESSAGE)
+                break
+            print(f"[triage] {i}/{len(ids)}")
+        print(f"[triage] обработано: {done}, пересобран подбор: {triage.rematch_all(conn)}")
