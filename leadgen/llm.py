@@ -32,6 +32,11 @@ def _extract_json(text: str) -> Optional[dict]:
             return None
 
 
+class LLMUnavailable(Exception):
+    """Сервер модели не ответил (упал, выгрузил модель, таймаут) — это не «отказ»,
+    сообщение нужно проверить позже."""
+
+
 class LMStudioClient:
     def __init__(self, base_url: Optional[str] = None, model: Optional[str] = None, timeout: int = 120):
         self.base_url = (base_url or settings.lm_studio_base_url).rstrip("/")
@@ -46,7 +51,9 @@ class LMStudioClient:
             return False
 
     def chat_json(self, system_prompt: str, user_prompt: str, retry: bool = True) -> Optional[dict]:
-        """Send a chat completion request and parse a JSON object out of the reply."""
+        """Send a chat completion request and parse a JSON object out of the reply.
+        Returns None if the model answered but no JSON could be parsed;
+        raises LLMUnavailable if the server didn't answer at all."""
         payload = {
             "model": self.model,
             "messages": [
@@ -62,8 +69,7 @@ class LMStudioClient:
             )
             resp.raise_for_status()
         except requests.RequestException as exc:
-            print(f"  [llm] request failed: {exc}")
-            return None
+            raise LLMUnavailable(str(exc)) from exc
 
         try:
             content = resp.json()["choices"][0]["message"]["content"]

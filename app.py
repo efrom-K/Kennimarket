@@ -411,6 +411,10 @@ def job_panel():
     job = current_job()
     if not job or not job["running"]:
         if job:
+            if "Модель так и не ответила" in tail(job["log"], 5):
+                st.error("Сбор остановлен: модель в LM Studio перестала отвечать. Найденное сохранено, "
+                         "непроверенные сообщения проверятся при следующем запуске. Проверьте, что в LM Studio "
+                         "сервер запущен и модель загружена, и запустите сбор снова.", icon=":material/memory:")
             with st.expander(f"Последняя задача: {job['title']} · завершена", icon=":material/history:"):
                 st.code(tail(job["log"], 200) or "—", language=None)
         return
@@ -424,6 +428,9 @@ def job_panel():
             stop_job(job)
             st.toast("Останавливаю… Всё собранное уже сохранено.", icon=":material/check:")
 
+        if "модель не отвечает" in tail(job["log"], 2):
+            st.warning("Модель в LM Studio не отвечает — жду до 5 минут и пробую снова. Проверьте LM Studio: "
+                       "сервер запущен, модель загружена.", icon=":material/hourglass_top:")
         if job["args"][0] == "telegram":
             log = tail(job["log"], 100000)
             total = next((int(l.rsplit(":", 1)[1]) for l in log.splitlines() if "чатов в списке:" in l), 0)

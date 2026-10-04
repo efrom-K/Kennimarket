@@ -1,9 +1,10 @@
 import re
+import time
 from typing import List, Optional
 
 from . import db
 from .config import settings
-from .llm import DGIS_SYSTEM_PROMPT, TELEGRAM_SYSTEM_PROMPT, LMStudioClient
+from .llm import DGIS_SYSTEM_PROMPT, TELEGRAM_SYSTEM_PROMPT, LLMUnavailable, LMStudioClient
 
 
 # Брокеры сами себя выдают; маленькая модель эти маркеры часто пропускает,
@@ -53,6 +54,26 @@ def _check_llm(llm: LMStudioClient) -> bool:
     return False
 
 
+def _ask(llm: LMStudioClient, prompt: str, text: str, retries: int = 10, wait: float = 30) -> Optional[dict]:
+    """Спросить модель, пережидая её падение/перезагрузку до ~5 минут.
+    Если так и не ответила — LLMUnavailable летит дальше и останавливает сбор."""
+    for attempt in range(retries + 1):
+        try:
+            return llm.chat_json(prompt, text)
+        except LLMUnavailable as exc:
+            if attempt == retries:
+                raise
+            print(f"  [llm] модель не отвечает ({exc}), жду {int(wait)} с и пробую снова "
+                  f"({attempt + 1}/{retries})...")
+            time.sleep(wait)
+
+
+LLM_DOWN_MESSAGE = (
+    "[!] Модель так и не ответила — сбор остановлен. Всё найденное сохранено, непроверенные "
+    "сообщения проверятся при следующем запуске. Проверьте LM Studio (сервер запущен, модель загружена)."
+)
+
+
 def run_telegram_pipeline(
     channels: List[str], limit_per_query: int = 200, min_confidence: float = 0.5, max_age_days: Optional[int] = None
 ) -> None:
@@ -69,9 +90,13 @@ def run_telegram_pipeline(
         for item in iter_telegram_messages(channels, limit_per_query, max_age_days):
             if db.raw_item_seen(conn, "telegram", item["source_id"]):
                 continue
+            try:
+                result = _ask(llm, TELEGRAM_SYSTEM_PROMPT, item["raw_text"])
+            except LLMUnavailable:
+                print(LLM_DOWN_MESSAGE)
+                break
+            # «проверено» только после ответа модели, иначе сбой модели = потерянный лид
             db.save_raw_item(conn, "telegram", item["source_id"], item["url"], item["raw_text"])
-
-            result = llm.chat_json(TELEGRAM_SYSTEM_PROMPT, item["raw_text"])
             if not is_telegram_lead(result, min_confidence):
                 continue
 
@@ -119,12 +144,16 @@ def run_dgis_pipeline(
         for item in iter_dgis_companies(queries, regions, pages_per_query):
             if db.raw_item_seen(conn, "2gis", str(item["source_id"])):
                 continue
-            db.save_raw_item(conn, "2gis", str(item["source_id"]), item["url"], item["raw_text"])
-
             if not item.get("phone"):
+                db.save_raw_item(conn, "2gis", str(item["source_id"]), item["url"], item["raw_text"])
                 continue  # без контакта лид бесполезен для холодного обзвона
 
-            result = llm.chat_json(DGIS_SYSTEM_PROMPT, item["raw_text"])
+            try:
+                result = _ask(llm, DGIS_SYSTEM_PROMPT, item["raw_text"])
+            except LLMUnavailable:
+                print(LLM_DOWN_MESSAGE)
+                break
+            db.save_raw_item(conn, "2gis", str(item["source_id"]), item["url"], item["raw_text"])
             if not result or not result.get("is_relevant"):
                 continue
             if float(result.get("confidence") or 0) < min_confidence:
