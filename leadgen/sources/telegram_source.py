@@ -1,124 +1,209 @@
 import re
-import time
+from datetime import datetime, timedelta, timezone
 from typing import Iterator, List, Optional
 
-import requests
-from bs4 import BeautifulSoup
+from ..config import settings
 
-# Cheap keyword prefilter so we don't burn an LLM call on every single message
-# in a busy channel - only texts that plausibly mention buying a warehouse
-# get sent to the model for real classification.
-KEYWORDS = [
+# Server-side search phrases run against the FULL history of each chat
+# (Telegram's own index, works on public groups/channels without joining).
+# Telegram search is fuzzy/morphological, so results are noisy - the regex
+# prefilter below and then the LLM do the real filtering.
+SEARCH_QUERIES = [
     "куплю склад",
-    "куплю складск",
-    "ищу склад для покуп",
-    "приобрет склад",
-    "приобрету склад",
-    "рассмотрю покупку склад",
-    "склад в собственность",
-    "куплю производственно-складск",
-    "куплю пск",
+    "купим склад",
     "покупка склада",
-    "интересует покупка склад",
-    "нужен склад в собственность",
-    "куплю помещение склад",
+    "приобрету склад",
+    "ищу склад",
+    "ищу клиенту склад",
+    "запрос склад",
+    "склад в собственность",
+    "куплю ПСК",
+    "куплю производственное помещение",
+    "купим промку",
+    "куплю ангар",
+    "куплю базу",
+    "участок под склад",
 ]
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+# Cheap prefilter so we don't burn an LLM call on every seller ad that
+# Telegram's fuzzy search drags in: need a buy-ish word AND a warehouse-ish object.
+_BUY_RE = re.compile(r"купл|купим|купит|покупк|приобр|ищу|ищем|запрос|в собственность", re.I)
+_OBJECT_RE = re.compile(r"склад|пск|производствен|промк|промназнач|ангар|логистич|индустри|industrial", re.I)
+# Seller/rent/job posts are most of what search returns; drop them unless the
+# text also has an explicit buy formula ("куплю", "ищу для клиента", "#запрос"...).
+_STRONG_BUY_RE = re.compile(
+    r"\bкуплю\b|\bкупим\b|хочу купить|хочет купить|(ищу|ищем) (для |под )?(клиент|покупател|инвестор)|"
+    r"(ищу|ищем) клиенту|запрос на покупк|на покупку|под покупку|для покупки|рассмотр\w* (покупк|приобрет)|"
+    r"#покупка|#ищу|#запрос|#куплю|(ищу|ищем) склад|нужен склад|приобрету|приобретем|приобретём",
+    re.I,
+)
+_SELL_RE = re.compile(
+    r"прода[её]тся|продаю|прода[её]м|продам|продажа|сда[её]тся|сдам|сдаю|сда[её]м|в аренду|аренда|предлага|"
+    r"вакан|требуются|ищем (сотрудник|кладовщ|работник)",
+    re.I,
+)
+
+# contacts.Search queries for discovering chats. Returns ~10 public chats each.
+DISCOVERY_QUERIES = [
+    "склад", "склады москва", "склады мо", "складская недвижимость", "куплю склад",
+    "коммерческая недвижимость", "коммерческая недвижимость москва", "коммерческая недвижимость мо",
+    "коммерческая недвижимость подмосковье", "недвижимость москва", "недвижимость подмосковье",
+    "недвижимость мо", "брокеры недвижимости", "брокеры коммерческой", "риэлторы москва",
+    "агенты недвижимости", "сделки недвижимость", "московские сделки", "инвестиции в недвижимость",
+    "производственная база", "производственные помещения", "промзона", "промышленная недвижимость",
+    "индустриальная недвижимость", "light industrial", "ангар", "земля под склад", "земельные участки мо",
+    "готовый бизнес", "арендный бизнес", "ГАБ", "продажа бизнеса", "покупка бизнеса",
+    "логистика москва", "фулфилмент", "селлеры wb", "селлеры ozon", "оптовики москва", "дистрибуция",
+    # чаты (группы), где и пишут запросы "куплю/ищу для клиента"
+    "чат брокеров", "чат риэлторов", "чат агентов недвижимости", "чат недвижимость", "чат коммерческая недвижимость",
+    "сделки чат", "объявления недвижимость", "куплю продам недвижимость", "покупка недвижимости",
+    "база объектов", "запросы покупателей", "ищу для клиента", "off market", "закрытые продажи",
+] + [
+    f"{prefix} {city}"
+    for city in [
+        "москва", "подмосковье", "подольск", "химки", "домодедово", "балашиха", "мытищи", "люберцы", "одинцово",
+        "красногорск", "королев", "щелково", "пушкино", "раменское", "сергиев посад", "коломна", "чехов",
+        "ногинск", "дмитров", "видное", "наро-фоминск", "истра", "солнечногорск", "клин", "электросталь",
+        "серпухов", "лобня", "долгопрудный", "реутов", "жуковский", "новая москва", "тинао",
+    ]
+    for prefix in ("недвижимость", "объявления")
+]
+# Job/delivery/cargo chats match "склад"/"логистика" by title but are noise.
+_TITLE_EXCLUDE_RE = re.compile(r"работ|вахт|ваканс|подработ|халтур|шабаш|грузчик|доставк|карго|такси", re.I)
+_TITLE_INCLUDE_RE = re.compile(
+    r"недвиж|склад|коммерч|промзон|промышл|индустри|industrial|габ|сделк|брокер|cre|земл|девелоп|логист|инвест",
+    re.I,
+)
 
 
 def _looks_relevant(text: str) -> bool:
-    low = text.lower()
-    return any(kw in low for kw in KEYWORDS)
+    if not (_BUY_RE.search(text) and _OBJECT_RE.search(text)):
+        return False
+    return bool(_STRONG_BUY_RE.search(text) or not _SELL_RE.search(text))
 
 
-def _fetch_page(channel: str, before: Optional[int] = None) -> Optional[str]:
-    """Telegram publishes a static, unauthenticated HTML preview of any public
-    channel at t.me/s/<channel> (no robots.txt exists for t.me at all, and this
-    is Telegram's own official rendering for logged-out users/search engines -
-    not a bypass of any access control). This avoids needing my.telegram.org
-    API credentials entirely."""
-    url = f"https://t.me/s/{channel}"
-    params = {"before": before} if before else {}
-    try:
-        resp = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=15)
-        resp.raise_for_status()
-        return resp.text
-    except requests.RequestException as exc:
-        print(f"  [telegram] запрос не удался ({url}, before={before}): {exc}")
-        return None
+def _client():
+    from telethon.sync import TelegramClient
+
+    if not settings.telegram_api_id or not settings.telegram_api_hash:
+        raise RuntimeError(
+            "TELEGRAM_API_ID / TELEGRAM_API_HASH не заданы в .env. "
+            "Получить за 1 минуту: https://my.telegram.org -> API development tools"
+        )
+    # Sleep through FloodWait instead of crashing a long scan.
+    return TelegramClient(
+        settings.telegram_session_name,
+        int(settings.telegram_api_id),
+        settings.telegram_api_hash,
+        flood_sleep_threshold=600,
+    )
 
 
-def _parse_messages(html: str) -> List[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    results = []
-    for wrap in soup.select("div.tgme_widget_message_wrap"):
-        post_div = wrap.select_one("div.tgme_widget_message[data-post]")
-        if not post_div:
-            continue
-        data_post = post_div.get("data-post", "")
-        if "/" not in data_post:
-            continue
-        channel, msg_id_str = data_post.split("/", 1)
-        try:
-            msg_id = int(msg_id_str)
-        except ValueError:
-            continue
+def discover_chats(queries: List[str] = None, min_members: int = 300, depth: int = 1) -> List[dict]:
+    """Finds public groups/channels via Telegram's global chat search, then
+    expands `depth` times via Telegram's "similar channels" recommendations
+    (works for broadcast channels only; recommended chats must match
+    _TITLE_INCLUDE_RE so the crawl doesn't drift off-topic)."""
+    from telethon.tl.functions.channels import GetChannelRecommendationsRequest
+    from telethon.tl.functions.contacts import SearchRequest
 
-        text_div = post_div.select_one("div.tgme_widget_message_text")
-        text = text_div.get_text("\n", strip=True) if text_div else ""
+    found = {}
 
-        results.append({"channel": channel, "msg_id": msg_id, "text": text})
-    return results
+    def add(chats, require_topic=False) -> List[str]:
+        new = []
+        for chat in chats:
+            username = getattr(chat, "username", None)
+            members = getattr(chat, "participants_count", None) or 0
+            title = chat.title or ""
+            if not username or username in found or members < min_members:
+                continue
+            if _TITLE_EXCLUDE_RE.search(title) or (require_topic and not _TITLE_INCLUDE_RE.search(title)):
+                continue
+            kind = "группа" if getattr(chat, "megagroup", False) else "канал"
+            found[username] = {"username": username, "title": title, "kind": kind, "members": members}
+            new.append(username)
+        return new
 
+    with _client() as client:
+        frontier = []
+        for q in queries or DISCOVERY_QUERIES:
+            try:
+                frontier += add(client(SearchRequest(q=q, limit=100)).chats)
+            except Exception as exc:
+                print(f"[tg-discover] '{q}': {exc}")
+            print(f"[tg-discover] '{q}': всего найдено {len(found)}")
 
-def iter_telegram_messages(channels: List[str], limit_per_channel: int = 500, delay: float = 1.0) -> Iterator[dict]:
-    """Yields dicts with source_id/url/raw_text for messages in public channels
-    that pass the keyword prefilter, scraping the public t.me/s/ web preview
-    (no login, no API credentials, no Telethon session needed).
-
-    Paginates backward via the `before=<msg_id>` query param that Telegram's
-    own "load more" link uses. Stops per channel once `limit_per_channel`
-    messages have been seen or a page returns no new (older) messages.
-    """
-    for channel in channels:
-        channel = channel.strip().lstrip("@")
-        if not channel:
-            continue
-        print(f"[telegram] сканирую @{channel} (до {limit_per_channel} сообщений)...")
-
-        seen_total = 0
-        before = None
-        min_seen_id = None
-
-        while seen_total < limit_per_channel:
-            html = _fetch_page(channel, before)
-            if html is None:
-                break
-
-            messages = _parse_messages(html)
-            if not messages:
-                break
-
-            # Page renders oldest-to-newest; walk oldest-first so `before`
-            # pagination always moves strictly backward in time.
-            messages.sort(key=lambda m: m["msg_id"])
-            page_min_id = messages[0]["msg_id"]
-
-            if min_seen_id is not None and page_min_id >= min_seen_id:
-                break  # no older messages returned, avoid infinite loop
-
-            for m in messages:
-                if not m["text"] or not _looks_relevant(m["text"]):
+        for level in range(depth):
+            next_frontier = []
+            for username in frontier:
+                if found[username]["kind"] != "канал":
                     continue
-                yield {
-                    "source_id": f"{channel}:{m['msg_id']}",
-                    "url": f"https://t.me/{channel}/{m['msg_id']}",
-                    "raw_text": m["text"],
-                    "telegram_username": None,
-                }
+                try:
+                    result = client(GetChannelRecommendationsRequest(channel=username))
+                except Exception as exc:
+                    print(f"[tg-discover] похожие для @{username}: {exc}")
+                    continue
+                next_frontier += add(result.chats, require_topic=True)
+            frontier = next_frontier
+            print(f"[tg-discover] похожие каналы, уровень {level + 1}: +{len(frontier)}, всего {len(found)}")
+    # Группы первыми: именно в чатах пишут запросы, каналы — в основном продавцы и новости.
+    return sorted(found.values(), key=lambda c: (c["kind"] != "группа", -c["members"]))
 
-            seen_total += len(messages)
-            min_seen_id = page_min_id
-            before = page_min_id
-            time.sleep(delay)  # be polite to t.me, this is a shared public endpoint
+
+def iter_telegram_messages(
+    channels: List[str], limit_per_query: int = 200, max_age_days: Optional[int] = None
+) -> Iterator[dict]:
+    """Yields dicts with source_id/url/raw_text/telegram_username/posted_at for messages
+    in public channels/groups found by server-side search (SEARCH_QUERIES)
+    that pass the regex prefilter.
+
+    First run will prompt interactively for your Telegram phone number + login
+    code (Telethon standard flow); after that a .session file caches the login.
+    """
+    from telethon.tl.types import User
+
+    seen_texts = set()  # одно и то же объявление постят десятки раз и в разные чаты
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days) if max_age_days else None
+    period = f"за {max_age_days} дн." if max_age_days else "по всей истории"
+    with _client() as client:
+        for channel in channels:
+            channel = channel.strip().lstrip("@")
+            if not channel:
+                continue
+            print(f"[telegram] ищу в @{channel} ({len(SEARCH_QUERIES)} запросов {period})...")
+            try:
+                for query in SEARCH_QUERIES:
+                    for msg in client.iter_messages(channel, search=query, limit=limit_per_query):
+                        if cutoff and msg.date < cutoff:
+                            break  # поиск отдаёт от новых к старым, дальше только старее
+                        if not msg.text or msg.text in seen_texts or not _looks_relevant(msg.text):
+                            continue
+                        seen_texts.add(msg.text)
+                        # В каналах отправитель — сам канал, контактом он не является;
+                        # юзернейм берём только у живого пользователя (посты в группах).
+                        try:
+                            sender = msg.get_sender()
+                        except Exception:
+                            sender = None
+                        tg_username = sender.username if isinstance(sender, User) else None
+                        yield {
+                            "source_id": f"{channel}:{msg.id}",
+                            "url": f"https://t.me/{channel}/{msg.id}",
+                            "raw_text": msg.text,
+                            "telegram_username": tg_username,
+                            "posted_at": msg.date.isoformat(),
+                        }
+            except Exception as exc:
+                print(f"[telegram] не удалось обработать @{channel}: {exc}")
+                continue
+
+
+if __name__ == "__main__":
+    # python3 -m leadgen.sources.telegram_source — самопроверка префильтра
+    assert _looks_relevant("Куплю склад от 120 кв.м в районе м. Свиблово.")
+    assert _looks_relevant("Ищу клиенту склады класса В на покупку, продажа не интересует")
+    assert _looks_relevant("#запрос Купим участок под склад, юг МО")
+    assert not _looks_relevant("Продается складской комплекс, рассмотрим аренду")
+    assert not _looks_relevant("Ищем кладовщика на склад")
+    assert not _looks_relevant("Куплю квартиру в Химках")
+    print("ok")

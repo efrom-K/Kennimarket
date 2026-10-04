@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS leads (
 );
 """
 
+# Columns added after the first release; ALTERed into existing DBs by init_db.
+NEW_LEAD_COLUMNS = ["posted_at TEXT", "buyer_type TEXT"]
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -42,7 +45,8 @@ def now_iso() -> str:
 
 @contextmanager
 def get_conn(db_path: str):
-    conn = sqlite3.connect(db_path)
+    # Автокоммит: долгий скан можно прервать Ctrl+C без потери уже собранного.
+    conn = sqlite3.connect(db_path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -54,6 +58,11 @@ def get_conn(db_path: str):
 def init_db(db_path: str) -> None:
     with get_conn(db_path) as conn:
         conn.executescript(SCHEMA)
+        for col in NEW_LEAD_COLUMNS:
+            try:
+                conn.execute(f"ALTER TABLE leads ADD COLUMN {col}")
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть
 
 
 def raw_item_seen(conn: sqlite3.Connection, source: str, source_id: str) -> bool:
@@ -78,8 +87,8 @@ def save_lead(conn: sqlite3.Connection, dedup_key: str, source: str, source_ref:
             INSERT INTO leads (
                 dedup_key, source, source_ref, intent, company_name, contact_name,
                 phone, email, telegram_username, location, area_sqm, budget,
-                confidence, notes, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                confidence, notes, posted_at, buyer_type, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 dedup_key,
@@ -96,6 +105,8 @@ def save_lead(conn: sqlite3.Connection, dedup_key: str, source: str, source_ref:
                 fields.get("budget"),
                 fields.get("confidence"),
                 fields.get("notes"),
+                fields.get("posted_at"),
+                fields.get("buyer_type"),
                 now_iso(),
             ),
         )

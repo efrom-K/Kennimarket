@@ -1,8 +1,34 @@
+import re
 from typing import List, Optional
 
 from . import db
 from .config import settings
 from .llm import DGIS_SYSTEM_PROMPT, TELEGRAM_SYSTEM_PROMPT, LMStudioClient
+
+
+# Брокеры сами себя выдают; маленькая модель эти маркеры часто пропускает,
+# поэтому правило важнее её ответа.
+_BROKER_RE = re.compile(
+    r"клиент|для инвестор|для покупател|под заказчик|заказчик|коллеги|комисси|#ищуклиенту|#куплюклиенту|агент|брокер|риэлтор|риелтор",
+    re.I,
+)
+
+
+def _buyer_type(text: str, llm_answer: Optional[str]) -> Optional[str]:
+    return "broker" if _BROKER_RE.search(text) else llm_answer
+
+
+def is_telegram_lead(result: Optional[dict], min_confidence: float) -> bool:
+    """Лид = все три ответа модели "да" и достаточная уверенность. Решение в коде,
+    а не в одном confidence: на прямые вопросы маленькая модель отвечает надёжнее."""
+    if not result:
+        return False
+    if not (result.get("wants_to_buy") and result.get("object_fits")) or result.get("other_region"):
+        return False
+    try:
+        return float(result.get("confidence") or 0) >= min_confidence
+    except (TypeError, ValueError):
+        return False
 
 
 def _dedup_key(fields: dict, source: str, source_id: str) -> str:
@@ -27,7 +53,9 @@ def _check_llm(llm: LMStudioClient) -> bool:
     return False
 
 
-def run_telegram_pipeline(channels: List[str], limit_per_channel: int = 500, min_confidence: float = 0.5) -> None:
+def run_telegram_pipeline(
+    channels: List[str], limit_per_query: int = 200, min_confidence: float = 0.5, max_age_days: Optional[int] = None
+) -> None:
     from .sources.telegram_source import iter_telegram_messages
 
     llm = LMStudioClient()
@@ -37,17 +65,13 @@ def run_telegram_pipeline(channels: List[str], limit_per_channel: int = 500, min
     db.init_db(settings.db_path)
     saved = 0
     with db.get_conn(settings.db_path) as conn:
-        for item in iter_telegram_messages(channels, limit_per_channel):
+        for item in iter_telegram_messages(channels, limit_per_query, max_age_days):
             if db.raw_item_seen(conn, "telegram", item["source_id"]):
                 continue
             db.save_raw_item(conn, "telegram", item["source_id"], item["url"], item["raw_text"])
 
             result = llm.chat_json(TELEGRAM_SYSTEM_PROMPT, item["raw_text"])
-            if not result or not result.get("is_relevant"):
-                continue
-            if result.get("intent") not in ("buy", "rent_with_buyout"):
-                continue
-            if float(result.get("confidence") or 0) < min_confidence:
+            if not is_telegram_lead(result, min_confidence):
                 continue
 
             fields = {
@@ -61,6 +85,8 @@ def run_telegram_pipeline(channels: List[str], limit_per_channel: int = 500, min
                 "budget": result.get("budget"),
                 "confidence": result.get("confidence"),
                 "notes": result.get("notes"),
+                "posted_at": item.get("posted_at"),
+                "buyer_type": _buyer_type(item["raw_text"], result.get("buyer_type")),
             }
             key = _dedup_key(fields, "telegram", item["source_id"])
             if db.save_lead(conn, key, "telegram", item["url"], fields):
