@@ -64,6 +64,7 @@ def run_telegram_pipeline(
 
     db.init_db(settings.db_path)
     saved = 0
+    print(f"[telegram] чатов в списке: {len(channels)}")
     with db.get_conn(settings.db_path) as conn:
         for item in iter_telegram_messages(channels, limit_per_query, max_age_days):
             if db.raw_item_seen(conn, "telegram", item["source_id"]):

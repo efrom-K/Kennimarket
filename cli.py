@@ -1,5 +1,6 @@
 import argparse
 import csv
+import os
 from datetime import datetime, timedelta, timezone
 
 from leadgen import db
@@ -27,10 +28,16 @@ def cmd_telegram(args):
 def cmd_tg_discover(args):
     from leadgen.sources.telegram_source import discover_chats
 
+    # Выключенные вручную чаты (строка начинается с "#") остаются выключенными.
+    disabled = set()
+    if os.path.exists(args.out):
+        with open(args.out, encoding="utf-8") as f:
+            disabled = {line.lstrip("# ").split()[0] for line in f if line.startswith("#") and line.strip("# \n")}
     chats = discover_chats(min_members=args.min_members, depth=args.depth)
     with open(args.out, "w", encoding="utf-8") as f:
         for c in chats:
-            f.write(f"{c['username']}  # {c['kind']}, {c['members']} уч., {c['title']}\n")
+            prefix = "# " if c["username"] in disabled else ""
+            f.write(f"{prefix}{c['username']}  # {c['kind']}, {c['members']} уч., {c['title']}\n")
     print(f"Найдено {len(chats)} чатов -> {args.out} (лишние можно удалить/закомментировать вручную)")
 
 

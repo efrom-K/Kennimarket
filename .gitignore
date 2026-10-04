@@ -9,3 +9,4 @@ leadgen.db
 *.csv
 .DS_Store
 CLAUDE.md
+logs/

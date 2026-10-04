@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS leads (
 """
 
 # Columns added after the first release; ALTERed into existing DBs by init_db.
-NEW_LEAD_COLUMNS = ["posted_at TEXT", "buyer_type TEXT"]
+NEW_LEAD_COLUMNS = ["posted_at TEXT", "buyer_type TEXT", "comment TEXT"]
 
 
 def now_iso() -> str:

@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3987e5"/>
+      <stop offset="1" stop-color="#1f5fb0"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <!-- склад: двускатная крыша, стены, ворота с ламелями -->
+  <path d="M232 470 L512 300 L792 470 L792 742 L232 742 Z" fill="#ffffff"/>
+  <rect x="372" y="530" width="280" height="212" fill="#1f5fb0"/>
+  <rect x="392" y="560" width="240" height="22" rx="4" fill="#ffffff" opacity="0.9"/>
+  <rect x="392" y="604" width="240" height="22" rx="4" fill="#ffffff" opacity="0.9"/>
+  <rect x="392" y="648" width="240" height="22" rx="4" fill="#ffffff" opacity="0.9"/>
+  <rect x="392" y="692" width="240" height="22" rx="4" fill="#ffffff" opacity="0.9"/>
+  <!-- метка «найден лид» -->
+  <circle cx="742" cy="330" r="92" fill="#eda100" stroke="#ffffff" stroke-width="22"/>
+  <path d="M700 330 L730 362 L788 300" fill="none" stroke="#ffffff" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
