@@ -1,5 +1,26 @@
 [theme]
+base = "light"
 primaryColor = "#2a78d6"
+backgroundColor = "#f6f7f9"
+secondaryBackgroundColor = "#eef1f5"
+textColor = "#16181d"
+linkColor = "#2a78d6"
+linkUnderline = false
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFontWeights = [700, 650, 600]
+baseRadius = "0.75rem"
+buttonRadius = "0.6rem"
+borderColor = "#e3e6eb"
+dataframeBorderColor = "#e3e6eb"
+dataframeHeaderBackgroundColor = "#f6f7f9"
+showWidgetBorder = true
+chartCategoricalColors = ["#2a78d6"]
+
+[theme.sidebar]
+backgroundColor = "#0f1729"
+secondaryBackgroundColor = "#1a2440"
+textColor = "#dfe4ee"
+borderColor = "#26314f"
 
 [browser]
 gatherUsageStats = false
