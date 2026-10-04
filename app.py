@@ -24,7 +24,7 @@ import streamlit as st
 from leadgen import db
 from leadgen.config import settings
 from leadgen import triage
-from leadgen.llm import LLMUnavailable, LMStudioClient
+from leadgen.llm import LLMUnavailable, LMStudioClient, ensure_model_running
 
 ROOT = Path(__file__).parent
 LOG_DIR = ROOT / "logs"
@@ -848,7 +848,13 @@ with st.sidebar:
         st.markdown(f"<div style='font-size:0.88rem;margin:4px 0'><span class='dot' style='background:{color}'></span>{text}</div>",
                     unsafe_allow_html=True)
 
-    status_line(llm_online(), f"Модель · {settings.lm_studio_model}" if llm_online() else "LM Studio не запущена")
+    status_line(llm_online(), f"Модель · {settings.lm_studio_model}" if llm_online() else "Модель не на связи")
+    if not llm_online():
+        if st.button("Запустить модель", icon=":material/power_settings_new:", width="stretch"):
+            with st.spinner("Запускаю LM Studio и загружаю модель…"):
+                ensure_model_running()
+            llm_online.clear()
+            st.rerun()
     status_line(SESSION_FILE.exists(), "Telegram подключён" if SESSION_FILE.exists() else "Telegram: нужен вход", warn=True)
     job = current_job()
     if job and job["running"]:

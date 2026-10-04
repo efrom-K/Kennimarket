@@ -4,7 +4,7 @@ from typing import List, Optional
 
 from . import db, triage
 from .config import settings
-from .llm import DGIS_SYSTEM_PROMPT, TELEGRAM_SYSTEM_PROMPT, LLMUnavailable, LMStudioClient
+from .llm import DGIS_SYSTEM_PROMPT, TELEGRAM_SYSTEM_PROMPT, LLMUnavailable, LMStudioClient, ensure_model_running
 
 
 # Брокеры сами себя выдают; маленькая модель эти маркеры часто пропускает,
@@ -54,7 +54,7 @@ def _dedup_key(fields: dict, source: str, source_id: str) -> str:
 
 
 def _check_llm(llm: LMStudioClient) -> bool:
-    if llm.ping():
+    if llm.ping() or ensure_model_running(llm.model):
         return True
     print(
         f"[!] LM Studio недоступна на {llm.base_url}. "
@@ -73,9 +73,10 @@ def _ask(llm: LMStudioClient, prompt: str, text: str, retries: int = 10, wait: f
         except LLMUnavailable as exc:
             if attempt == retries:
                 raise
-            print(f"  [llm] модель не отвечает ({exc}), жду {int(wait)} с и пробую снова "
+            print(f"  [llm] модель не отвечает ({exc}), перезапускаю и пробую снова "
                   f"({attempt + 1}/{retries})...")
-            time.sleep(wait)
+            if not ensure_model_running(getattr(llm, "model", None)):  # LM Studio выгрузила модель — грузим снова
+                time.sleep(wait)
 
 
 LLM_DOWN_MESSAGE = (

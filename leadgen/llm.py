@@ -1,5 +1,7 @@
 import json
 import re
+import subprocess
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -30,6 +32,32 @@ def _extract_json(text: str) -> Optional[dict]:
             return json.loads(cleaned)
         except json.JSONDecodeError:
             return None
+
+
+LMS_CLI = Path.home() / ".lmstudio" / "bin" / "lms"
+
+
+def ensure_model_running(model: Optional[str] = None) -> bool:
+    """Поднять сервер LM Studio и загрузить модель, если они не запущены (через CLI `lms`,
+    который ставится вместе с LM Studio). Безопасно вызывать сколько угодно раз: модель
+    не грузится повторно. True — модель на месте и сервер отвечает."""
+    client = LMStudioClient()
+    model = model or client.model
+    if not LMS_CLI.exists():  # LM Studio не установлена — остаётся надеяться на ручной запуск
+        return client.ping()
+    try:
+        if not client.ping():
+            subprocess.run([str(LMS_CLI), "server", "start"], capture_output=True, timeout=90)
+        out = subprocess.run([str(LMS_CLI), "ps", "--json"], capture_output=True, text=True, timeout=60).stdout
+        try:
+            loaded = {m.get("identifier") for m in json.loads(out or "[]")} | {m.get("modelKey") for m in json.loads(out or "[]")}
+        except ValueError:
+            loaded = set()
+        if model not in loaded:
+            subprocess.run([str(LMS_CLI), "load", model, "-y"], capture_output=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return client.ping()
 
 
 class LLMUnavailable(Exception):

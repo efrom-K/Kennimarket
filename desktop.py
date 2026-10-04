@@ -8,6 +8,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from pathlib import Path
@@ -73,6 +74,14 @@ def _listening() -> bool:
         return s.connect_ex(("127.0.0.1", PORT)) == 0
 
 
+def _start_model() -> None:
+    try:
+        from leadgen.llm import ensure_model_running
+        ensure_model_running()
+    except Exception:
+        pass  # без модели интерфейс всё равно откроется и покажет, что модель не на связи
+
+
 def _set_mac_app_identity() -> None:
     # Процесс — это python из .venv, поэтому без подмены macOS покажет в меню «Python».
     try:
@@ -88,6 +97,17 @@ def _set_mac_app_identity() -> None:
 
 
 def main() -> None:
+    # Модель LM Studio поднимаем в фоне, чтобы окно не ждало (5–10 с на загрузку).
+    threading.Thread(target=_start_model, daemon=True).start()
+    # Сервер интерфейса, оставшийся от прошлого запуска (например, после сбоя), может быть
+    # со старым кодом — гасим и поднимаем свежий.
+    stale = subprocess.run(["lsof", "-ti", f"tcp:{PORT}", "-sTCP:LISTEN"], capture_output=True, text=True).stdout
+    for pid in stale.split():
+        subprocess.run(["kill", pid], capture_output=True)
+    for _ in range(20):
+        if not _listening():
+            break
+        time.sleep(0.25)
     server = None
     if not _listening():
         (ROOT / "logs").mkdir(exist_ok=True)
