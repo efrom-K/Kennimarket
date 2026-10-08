@@ -26,19 +26,24 @@ def cmd_telegram(args):
 
 
 def cmd_tg_discover(args):
-    from leadgen.sources.telegram_source import discover_chats
+    from leadgen.sources.telegram_source import PROBE_DAYS, discover_chats
 
-    # Выключенные вручную чаты (строка начинается с "#") остаются выключенными.
-    disabled = set()
+    # Выключенные вручную чаты (строка начинается с "#") остаются выключенными,
+    # включённые перепроверяются заново вместе с новыми кандидатами.
+    disabled, seeds = set(), []
     if os.path.exists(args.out):
         with open(args.out, encoding="utf-8") as f:
-            disabled = {line.lstrip("# ").split()[0] for line in f if line.startswith("#") and line.strip("# \n")}
-    chats = discover_chats(min_members=args.min_members, depth=args.depth)
+            for line in f:
+                name = line.lstrip("# ").split("#")[0].strip()
+                if name:
+                    (disabled.add(name) if line.startswith("#") else seeds.append(name))
+    chats = discover_chats(seeds=seeds, min_members=args.min_members, depth=args.depth)
     with open(args.out, "w", encoding="utf-8") as f:
         for c in chats:
             prefix = "# " if c["username"] in disabled else ""
-            f.write(f"{prefix}{c['username']}  # {c['kind']}, {c['members']} уч., {c['title']}\n")
-    print(f"Найдено {len(chats)} чатов -> {args.out} (лишние можно удалить/закомментировать вручную)")
+            f.write(f"{prefix}{c['username']}  # {c['kind']}, {c['members']} уч., "
+                    f"{c['title']} · запросов за {PROBE_DAYS} дн.: {c['hits']}\n")
+    print(f"Чатов с запросами на покупку: {len(chats)} -> {args.out}")
 
 
 def cmd_dgis(args):
@@ -59,11 +64,11 @@ def cmd_stats(_args):
 def cmd_export(args):
     db.init_db(settings.db_path)
     with db.get_conn(settings.db_path) as conn:
-        query = "SELECT * FROM leads"
+        query = "SELECT * FROM leads WHERE status != 'rejected'"
         params = ()
         if args.max_age_days:
             # лиды без даты (2GIS) не отсекаем — у них нет понятия "свежести"
-            query += " WHERE posted_at IS NULL OR posted_at >= ?"
+            query += " AND (posted_at IS NULL OR posted_at >= ?)"
             params = ((datetime.now(timezone.utc) - timedelta(days=args.max_age_days)).isoformat(),)
         query += " ORDER BY posted_at IS NULL, posted_at DESC, confidence DESC"
         rows = conn.execute(query, params).fetchall()

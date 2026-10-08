@@ -57,7 +57,7 @@ def query(sql: str, params=()) -> pd.DataFrame:
 def load_leads() -> pd.DataFrame:
     df = query(
         """
-        SELECT l.id, l.posted_at, l.status, l.buyer_type, l.confidence, l.telegram_username, l.phone,
+        SELECT l.id, l.posted_at, l.status, l.buyer_type, l.lead_kind, l.confidence, l.telegram_username, l.phone,
                l.contact_name, l.company_name, l.location, l.area_sqm, l.budget, l.source, l.source_ref,
                l.notes, l.comment, l.created_at, l.sent_at, r.raw_text,
                p.lead_id IS NOT NULL AS has_profile, p.profile_json, p.draft, p.draft_edited
@@ -322,6 +322,8 @@ def lead_card(lead_id: int, r: pd.Series) -> None:
         with top_l:
             color, icon = BUYER_BADGE[r["buyer_label"]]
             st.badge(r["buyer_label"], color=color, icon=icon)
+            if r["lead_kind"] == "gab":
+                st.badge("Инвестор в ГАБ · склад с арендатором", color="orange", icon=":material/payments:")
             st.markdown(f"<span class='lead-meta'>{human_date(r['posted_at'])}"
                         f"{' · @' + r['chat'] if pd.notna(r['chat']) else ''}</span>", unsafe_allow_html=True)
         with top_r:
@@ -364,7 +366,7 @@ def page_leads():
     f1, f2, f3 = st.columns([1, 1.7, 2.9], vertical_alignment="bottom")
     f5, f4 = st.columns([2.4, 3.2], vertical_alignment="bottom")
     msg_filter = f5.segmented_control("Первое сообщение", ["Все", "Готово", "Не подходит", "Отправлено"], default="Все")
-    period = f1.selectbox("Период", ["7 дней", "30 дней", "90 дней", "Год", "Всё время"], index=2)
+    period = f1.selectbox("Период", ["7 дней", "30 дней", "90 дней", "Год", "Всё время"], index=1)
     types = f2.segmented_control("Кто ищет", ["Покупатель", "Брокер", "Неясно"], selection_mode="multi",
                                  default=["Покупатель", "Брокер", "Неясно"])
     statuses = f3.segmented_control("Статус", list(STATUSES.values()), selection_mode="multi",
@@ -566,10 +568,10 @@ def page_run():
         chats = read_channels()
         enabled = chats[chats["enabled"]] if not chats.empty else chats
         n_groups = int((enabled["kind"] == "группа").sum()) if not enabled.empty else 0
-        scope = st.segmented_control("Где искать", [f"Группы · {n_groups}", f"Все чаты · {len(enabled)}"],
-                                     default=f"Группы · {n_groups}",
-                                     help="В группах почти все запросы покупателей, каналы — в основном продавцы")
-        days = st.select_slider("Свежесть сообщений", options=[7, 14, 30, 60, 90, 180, 365], value=90,
+        scope = st.segmented_control("Где искать", [f"Все чаты · {len(enabled)}", f"Только группы · {n_groups}"],
+                                     default=f"Все чаты · {len(enabled)}",
+                                     help="В списке только чаты, где поиск чатов нашёл запросы на покупку")
+        days = st.select_slider("Свежесть сообщений", options=[7, 14, 30, 60, 90, 180, 365], value=30,
                                 format_func=lambda d: f"до {d} дн.")
         with st.expander("Дополнительно", icon=":material/tune:"):
             limit = st.number_input("Результатов на поисковую фразу в чате", 20, 1000, 200, step=20)
@@ -591,7 +593,8 @@ def page_run():
 
     with right.container(border=True):
         st.subheader(":material/explore: Найти новые чаты")
-        st.caption("Ищет публичные чаты и каналы о недвижимости и складах. Выключенные вами чаты останутся выключенными.")
+        st.caption("Ищет публичные чаты и оставляет только те, где за полгода были запросы на покупку складов. "
+                   "Занимает 10–30 минут. Выключенные вами чаты останутся выключенными.")
         depth = st.segmented_control("Раскрутка через «похожие каналы»", [0, 1, 2], default=1,
                                      format_func=lambda d: {0: "Нет", 1: "1 уровень", 2: "2 уровня"}[d])
         min_members = st.number_input("Минимум участников", 0, 100000, 300, step=100)

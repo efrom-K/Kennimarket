@@ -19,12 +19,25 @@ def _buyer_type(text: str, llm_answer: Optional[str]) -> Optional[str]:
     return "broker" if _BROKER_RE.search(text) else llm_answer
 
 
+# Метка "склад" только если речь о складе/производстве/земле: на ГАБ с "Пятёрочкой" модель тоже
+# отвечает object_fits=true, поэтому метку ставит код по тексту.
+_WAREHOUSE_RE = re.compile(
+    r"склад|пск|производств|промк|промзон|промназнач|промышл|ангар|логистич|индустри|industrial|земл|участ|\bзу\b|з/у",
+    re.I,
+)
+
+
+def lead_kind(raw_text: str, result: dict) -> str:
+    return "warehouse" if result.get("object_fits") and _WAREHOUSE_RE.search(raw_text) else "gab"
+
+
 def is_telegram_lead(result: Optional[dict], min_confidence: float) -> bool:
     """Лид = все три ответа модели "да" и достаточная уверенность. Решение в коде,
     а не в одном confidence: на прямые вопросы маленькая модель отвечает надёжнее."""
     if not result:
         return False
-    if not (result.get("wants_to_buy") and result.get("object_fits")) or result.get("other_region"):
+    fits = result.get("object_fits") or result.get("gab_investor")  # инвестору в ГАБ предложим склад с арендатором
+    if not (result.get("wants_to_buy") and fits) or result.get("other_region"):
         return False
     try:
         return float(result.get("confidence") or 0) >= min_confidence
@@ -124,6 +137,7 @@ def run_telegram_pipeline(
                 "notes": result.get("notes"),
                 "posted_at": item.get("posted_at"),
                 "buyer_type": _buyer_type(item["raw_text"], result.get("buyer_type")),
+                "lead_kind": lead_kind(item["raw_text"], result),
             }
             key = _dedup_key(fields, "telegram", item["source_id"])
             if db.save_lead(conn, key, "telegram", item["url"], fields):
@@ -131,6 +145,7 @@ def run_telegram_pipeline(
                 label = fields.get("company_name") or fields.get("contact_name") or key
                 print(f"  [+] lead #{saved}: {label}")
                 lead_id = conn.execute("SELECT id FROM leads WHERE dedup_key = ?", (key,)).fetchone()[0]
+                conn.execute("UPDATE leads SET lead_kind = ? WHERE id = ?", (fields["lead_kind"], lead_id))
                 try:  # сразу готовим первое сообщение; не вышло — подготовится командой triage
                     triage.process_lead(conn, llm, lead_id)
                 except LLMUnavailable:
