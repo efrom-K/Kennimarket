@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
 """
 
 # Columns added after the first release; ALTERed into existing DBs by init_db.
-NEW_LEAD_COLUMNS = ["posted_at TEXT", "buyer_type TEXT", "comment TEXT", "sent_at TEXT", "lead_kind TEXT"]
+NEW_LEAD_COLUMNS = ["posted_at TEXT", "buyer_type TEXT", "comment TEXT", "sent_at TEXT", "lead_kind TEXT", "tg_user_id INTEGER"]
 
 
 def now_iso() -> str:

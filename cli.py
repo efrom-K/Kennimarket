@@ -61,25 +61,124 @@ def cmd_stats(_args):
         print(f"  {row[0]}: {row[1]}")
 
 
+EXPORT_COLUMNS = [  # (заголовок, ширина в xlsx)
+    ("№", 6), ("Кто", 16), ("Тип", 14), ("Дата", 11), ("Имя", 22), ("Telegram", 22), ("Телефон", 15),
+    ("Как связаться", 34), ("Что ищет (кратко)", 48), ("Локация", 26), ("Площадь", 12), ("Бюджет", 16),
+    ("Текст запроса", 70), ("Черновик первого сообщения", 60), ("Сообщение в чате", 30), ("Комментарий", 24),
+]
+BUYER_ORDER = {"direct": 0, "unknown": 1, "broker": 2}
+BUYER_LABEL = {"direct": "Покупатель", "unknown": "Не ясно", "broker": "Брокер"}
+KIND_LABEL = {"warehouse": "Склад / земля", "gab": "ГАБ-инвестор"}
+
+
+def _export_rows(conn, max_age_days: int) -> list:
+    query = ("SELECT l.*, r.raw_text, COALESCE(p.draft_edited, p.draft) AS draft FROM leads l"
+             " LEFT JOIN raw_items r ON r.url = l.source_ref LEFT JOIN lead_profiles p ON p.lead_id = l.id"
+             " WHERE l.status != 'rejected'")
+    params = ()
+    if max_age_days:
+        # лиды без даты (2GIS) не отсекаем — у них нет понятия "свежести"
+        query += " AND (l.posted_at IS NULL OR l.posted_at >= ?)"
+        params = ((datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat(),)
+    rows = conn.execute(query, params).fetchall()
+    # сначала прямые покупатели, потом брокеры; внутри — свежие сверху
+    rows.sort(key=lambda r: r["posted_at"] or "", reverse=True)
+    rows.sort(key=lambda r: BUYER_ORDER.get(r["buyer_type"], 1))
+    out = []
+    for r in rows:
+        user, phone, uid = r["telegram_username"], r["phone"], r["tg_user_id"]
+        if user:
+            how = f"Написать в Telegram @{user}"
+        elif uid:
+            how = (f"Нет @username: ответить на сообщение в чате или открыть tg://user?id={uid} "
+                   "(сработает после захода в этот чат)")
+        else:
+            how = "Ответить на сообщение в чате"
+        if phone:
+            how += f"; звонок / WhatsApp {phone}"
+        name = (r["contact_name"] or "").strip(" .") or (f"@{user}" if user else "без имени")
+        out.append({
+            "buyer": r["buyer_type"] or "unknown",
+            "values": [
+                r["id"], BUYER_LABEL.get(r["buyer_type"], "Не ясно"), KIND_LABEL.get(r["lead_kind"], r["lead_kind"] or ""),
+                (r["posted_at"] or "")[:10], name, f"@{user}" if user else "", phone or "", how,
+                r["notes"] or "", r["location"] or "", r["area_sqm"] or "", r["budget"] or "",
+                (r["raw_text"] or "").strip(), r["draft"] or "", r["source_ref"] or "", r["comment"] or "",
+            ],
+            "links": {"Telegram": f"https://t.me/{user}" if user else None, "Сообщение в чате": r["source_ref"]},
+        })
+    return out
+
+
+def _write_xlsx(path: str, rows: list) -> None:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    fills = {"direct": "E2F0D9", "unknown": "FFF2CC", "broker": "F2F2F2"}  # зелёный / жёлтый / серый
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Лиды"
+    headers = [h for h, _ in EXPORT_COLUMNS]
+    ws.append(headers)
+    thin = Side(style="thin", color="BFBFBF")
+    for i, (_, width) in enumerate(EXPORT_COLUMNS, 1):
+        c = ws.cell(row=1, column=i)
+        c.font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+        c.fill = PatternFill("solid", fgColor="305496")
+        c.alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
+        ws.column_dimensions[c.column_letter].width = width
+    for r in rows:
+        ws.append(r["values"])
+        n = ws.max_row
+        for i, h in enumerate(headers, 1):
+            c = ws.cell(row=n, column=i)
+            c.font = Font(name="Arial", size=10, bold=h in ("Имя", "Кто"))
+            c.fill = PatternFill("solid", fgColor=fills.get(r["buyer"], "FFFFFF"))
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+            c.border = Border(top=thin, bottom=thin, left=thin, right=thin)
+            link = r["links"].get(h)
+            if link:
+                c.hyperlink = link
+                c.font = Font(name="Arial", size=10, color="0563C1", underline="single")
+    ws.freeze_panes = "F2"  # № … Имя и шапка остаются на месте при прокрутке
+    ws.auto_filter.ref = ws.dimensions
+    ws.row_dimensions[1].height = 30
+    legend = wb.create_sheet("Пояснения")
+    for line in [
+        ("Цвет строки", ""), ("Зелёный", "Покупатель — ищет для себя, писать в первую очередь"),
+        ("Жёлтый", "Не ясно, сам или для клиента"), ("Серый", "Брокер — ищет для клиента, делится комиссией"),
+        ("", ""), ("Колонки", ""), ("Как связаться", "Telegram @username, если есть; иначе — ответ на сообщение в чате. "
+         "Телефон есть, только если автор сам его написал или открыл в Telegram"),
+        ("Что ищет (кратко)", "Пояснение модели, почему это лид"),
+        ("Черновик первого сообщения", "Готовый текст, если среди ваших объектов есть подходящий склад"),
+    ]:
+        legend.append(line)
+    legend.column_dimensions["A"].width = 28
+    legend.column_dimensions["B"].width = 90
+    for row in legend.iter_rows():
+        for c in row:
+            c.font = Font(name="Arial", size=10, bold=c.column == 1)
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+    for name, color in (("A2", "E2F0D9"), ("A3", "FFF2CC"), ("A4", "F2F2F2")):
+        legend[name].fill = PatternFill("solid", fgColor=color)
+    wb.save(path)
+
+
 def cmd_export(args):
     db.init_db(settings.db_path)
     with db.get_conn(settings.db_path) as conn:
-        query = "SELECT * FROM leads WHERE status != 'rejected'"
-        params = ()
-        if args.max_age_days:
-            # лиды без даты (2GIS) не отсекаем — у них нет понятия "свежести"
-            query += " AND (posted_at IS NULL OR posted_at >= ?)"
-            params = ((datetime.now(timezone.utc) - timedelta(days=args.max_age_days)).isoformat(),)
-        query += " ORDER BY posted_at IS NULL, posted_at DESC, confidence DESC"
-        rows = conn.execute(query, params).fetchall()
+        rows = _export_rows(conn, args.max_age_days)
     if not rows:
         print("Лидов пока нет.")
         return
-    with open(args.out, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(rows[0].keys())
-        for row in rows:
-            writer.writerow([row[k] for k in row.keys()])
+    if args.out.lower().endswith(".xlsx"):
+        _write_xlsx(args.out, rows)
+    else:
+        # ";" — разделитель, который русский Excel открывает по двойному клику
+        with open(args.out, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow([h for h, _ in EXPORT_COLUMNS])
+            writer.writerows([" ".join(str(v).split()) for v in r["values"]] for r in rows)
     print(f"Экспортировано {len(rows)} лидов -> {args.out}")
 
 
@@ -116,7 +215,7 @@ def main():
     sub.add_parser("stats").set_defaults(func=cmd_stats)
 
     p_exp = sub.add_parser("export")
-    p_exp.add_argument("--out", default="leads.csv")
+    p_exp.add_argument("--out", default="leads.xlsx", help=".xlsx — с цветом и ссылками, .csv — плоская таблица")
     p_exp.add_argument("--max-age-days", type=int, default=0, help="Только сообщения не старше N дней (0 — все)")
     p_exp.set_defaults(func=cmd_export)
 

@@ -366,14 +366,14 @@ def page_leads():
     f1, f2, f3 = st.columns([1, 1.7, 2.9], vertical_alignment="bottom")
     f5, f4 = st.columns([2.4, 3.2], vertical_alignment="bottom")
     msg_filter = f5.segmented_control("Первое сообщение", ["Все", "Готово", "Не подходит", "Отправлено"], default="Все")
-    period = f1.selectbox("Период", ["7 дней", "30 дней", "90 дней", "Год", "Всё время"], index=1)
+    period = f1.selectbox("Период", ["7 дней", "30 дней", "60 дней", "90 дней", "Год", "Всё время"], index=2)
     types = f2.segmented_control("Кто ищет", ["Покупатель", "Брокер", "Неясно"], selection_mode="multi",
                                  default=["Покупатель", "Брокер", "Неясно"])
     statuses = f3.segmented_control("Статус", list(STATUSES.values()), selection_mode="multi",
                                     default=[s for k, s in STATUSES.items() if k != "rejected"])
     search = f4.text_input("Поиск", placeholder="Химки, 1000 м², класс А…", icon=":material/search:")
 
-    days = {"7 дней": 7, "30 дней": 30, "90 дней": 90, "Год": 365}.get(period)
+    days = {"7 дней": 7, "30 дней": 30, "60 дней": 60, "90 дней": 90, "Год": 365}.get(period)
     view = with_labels(leads)
     if days:
         view = view[view["posted_at"] >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)]
@@ -571,7 +571,7 @@ def page_run():
         scope = st.segmented_control("Где искать", [f"Все чаты · {len(enabled)}", f"Только группы · {n_groups}"],
                                      default=f"Все чаты · {len(enabled)}",
                                      help="В списке только чаты, где поиск чатов нашёл запросы на покупку")
-        days = st.select_slider("Свежесть сообщений", options=[7, 14, 30, 60, 90, 180, 365], value=30,
+        days = st.select_slider("Свежесть сообщений", options=[7, 14, 30, 60, 90, 180, 365], value=60,
                                 format_func=lambda d: f"до {d} дн.")
         with st.expander("Дополнительно", icon=":material/tune:"):
             limit = st.number_input("Результатов на поисковую фразу в чате", 20, 1000, 200, step=20)

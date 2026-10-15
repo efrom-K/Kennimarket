@@ -10,3 +10,5 @@ leadgen.db
 .DS_Store
 CLAUDE.md
 logs/
+*.xlsx
+~$*

@@ -348,7 +348,8 @@ def iter_telegram_messages(
                             sender = None
                         # боты-агрегаторы (…_bot) переписку не ведут — это не контакт
                         person = isinstance(sender, User) and not sender.bot
-                        tg_username = sender.username if person else None
+                        tg_username = _username(sender) if person else None
+                        tg_name = " ".join(filter(None, [sender.first_name, sender.last_name])) if person else None
                         # номер виден, только если человек открыл его в настройках приватности
                         tg_phone = f"+{sender.phone}" if person and sender.phone else None
                         yield {
@@ -357,6 +358,8 @@ def iter_telegram_messages(
                             "raw_text": msg.text,
                             "telegram_username": tg_username,
                             "telegram_phone": tg_phone,
+                            "telegram_user_id": sender.id if person else None,
+                            "telegram_name": tg_name,
                             "posted_at": msg.date.isoformat(),
                         }
             except Exception as exc:

@@ -55,8 +55,19 @@ def normalize_phone(phone: Optional[str]) -> Optional[str]:
     return phone.strip() if phone and phone.strip() else None
 
 
+_PHONE_RE = re.compile(r"(?:\+7|\b8)[\s(-]*9\d{2}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}\b")
+_MENTION_RE = re.compile(r"(?:@|t\.me/)([A-Za-z]\w{4,31})")
+
+
+def text_contacts(text: str) -> tuple:
+    """Телефон и @username, которые автор написал в самом тексте (модель их иногда пропускает)."""
+    phone = _PHONE_RE.search(text or "")
+    mention = next((m for m in _MENTION_RE.findall(text or "") if not m.lower().endswith("bot")), None)
+    return (normalize_phone(phone.group()) if phone else None), mention
+
+
 def _dedup_key(fields: dict, source: str, source_id: str) -> str:
-    for key in ("phone", "email", "telegram_username"):
+    for key in ("phone", "email", "telegram_username", "tg_user_id"):
         val = normalize_phone(fields.get(key)) if key == "phone" else fields.get(key)
         if val:
             return f"{key}:{str(val).strip().lower()}"
@@ -124,12 +135,14 @@ def run_telegram_pipeline(
             if not is_telegram_lead(result, min_confidence):
                 continue
 
+            text_phone, text_user = text_contacts(item["raw_text"])
             fields = {
                 "intent": result.get("intent"),
                 "company_name": result.get("company_name"),
-                "contact_name": result.get("contact_name"),
-                "phone": normalize_phone(result.get("phone") or item.get("telegram_phone")),
-                "telegram_username": item.get("telegram_username"),
+                "contact_name": result.get("contact_name") or item.get("telegram_name"),
+                "phone": normalize_phone(result.get("phone") or item.get("telegram_phone")) or text_phone,
+                "telegram_username": item.get("telegram_username") or text_user,
+                "tg_user_id": item.get("telegram_user_id"),
                 "location": result.get("location"),
                 "area_sqm": result.get("area_sqm"),
                 "budget": result.get("budget"),
@@ -145,7 +158,8 @@ def run_telegram_pipeline(
                 label = fields.get("company_name") or fields.get("contact_name") or key
                 print(f"  [+] lead #{saved}: {label}")
                 lead_id = conn.execute("SELECT id FROM leads WHERE dedup_key = ?", (key,)).fetchone()[0]
-                conn.execute("UPDATE leads SET lead_kind = ? WHERE id = ?", (fields["lead_kind"], lead_id))
+                conn.execute("UPDATE leads SET lead_kind = ?, tg_user_id = ? WHERE id = ?",
+                             (fields["lead_kind"], fields["tg_user_id"], lead_id))
                 try:  # сразу готовим первое сообщение; не вышло — подготовится командой triage
                     triage.process_lead(conn, llm, lead_id)
                 except LLMUnavailable:
@@ -227,3 +241,10 @@ def run_triage() -> None:
                 break
             print(f"[triage] {i}/{len(ids)}")
         print(f"[triage] обработано: {done}, пересобран подбор: {triage.rematch_all(conn)}")
+
+
+if __name__ == "__main__":  # self-check: python3 -m leadgen.pipeline
+    assert text_contacts("Станислав 89037118887") == ("+79037118887", None)
+    assert text_contacts("📞 +7 (918) 116-51-42 👤 Telegram: @Nikita_Kononenko") == ("+79181165142", "Nikita_Kononenko")
+    assert text_contacts("бот @MoyDom_Rielty_bot, ИНН 7701234567") == (None, None)
+    print("ok")

@@ -108,7 +108,7 @@ python3 cli.py dgis --pages 10
 python3 cli.py stats
 
 # Выгрузка в CSV
-python3 cli.py export --out leads.csv
+python3 cli.py export --out leads.xlsx --max-age-days 60
 ```
 
 Обе команды (`telegram`, `dgis`) идемпотентны и докручиваются: уже виденные `raw_items`
